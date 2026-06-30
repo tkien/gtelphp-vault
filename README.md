@@ -26,6 +26,8 @@ composer require gtelphp/vault
 - [Quick start (plain PHP)](#quick-start-plain-php)
 - [Laravel installation](#laravel-installation)
 - [Configuration reference](#configuration-reference)
+- [Caching (don't skip this in production)](#caching-dont-skip-this-in-production)
+- [Auto-loading env + database credentials at boot (Laravel)](#auto-loading-env--database-credentials-at-boot-laravel)
 - [KV v2 secrets](#kv-v2-secrets)
 - [Transit (encrypt / decrypt / sign / hmac)](#transit-encrypt--decrypt--sign--hmac)
 - [Database secrets engine](#database-secrets-engine)
@@ -121,10 +123,62 @@ Or inject `GtelPhp\Vault\Client` / `GtelPhp\Vault\Manager` via the container as 
 | `connections.{name}.namespace` | Vault Enterprise / HCP namespace header | `null` |
 | `connections.{name}.token_cache.driver` | `memory` or `redis` | `redis` |
 | `connections.{name}.token_renew_threshold` | Renew once this fraction of the TTL has elapsed | `0.7` |
+| `connections.{name}.kv_cache.enabled` / `.ttl` | Read-through cache for `kv()->get()` (Redis) | `false` / `300` |
+| `connections.{name}.database_cache.enabled` | Cache for `database()->credentials()`, TTL'd to the lease itself | `true` |
 | `casts.transit_key` | Default Transit key used by `JsonEncryptedCast` | `app` |
 | `env.path` | Default secret path for `Vault::bootstrap()` | `env` |
+| `auto.enabled` | Auto-load env secrets + DB credentials during boot, no manual `bootstrap/app.php` edits needed | `false` |
+| `auto.env_path` | KV path to load when `auto.enabled` is true | `env` |
+| `auto.database` | Map of `{laravel_connection: vault_database_role}` to auto-inject | `[]` |
 
 In plain PHP, build a `GtelPhp\Vault\Support\VaultConfig` directly (constructor or `VaultConfig::fromArray()`), no Laravel config required.
+
+## Caching (don't skip this in production)
+
+Two things are cached automatically once Redis is available, to avoid hammering Vault and (for database credentials) avoid minting a brand new database user on every single call:
+
+- **`Vault::kv()->get()`** — opt-in via `VAULT_KV_CACHE_ENABLED=true` / `VAULT_KV_CACHE_TTL=300`. Any write (`put`/`patch`/`delete`/`destroy`/`undelete`) immediately invalidates that path's cache entry.
+- **`Vault::database()->credentials($role)`** — **enabled by default**. Cached for the lease's own `lease_duration` (minus a small safety margin), never longer, so it's always refreshed before the underlying credentials actually expire. Disable with `VAULT_DATABASE_CACHE_ENABLED=false` if you really want a fresh lease on every call; use `Vault::database()->freshCredentials($role)` to force a refresh on demand instead, or `Vault::database()->forget($role)` to drop the cached entry.
+
+```env
+VAULT_KV_CACHE_ENABLED=true
+VAULT_KV_CACHE_TTL=300
+VAULT_DATABASE_CACHE_ENABLED=true
+```
+
+In plain PHP, pass a Redis client into `Client::make()`:
+
+```php
+$vault = Client::make($config, redis: $redisClient);
+```
+
+## Auto-loading env + database credentials at boot (Laravel)
+
+Instead of manually editing `bootstrap/app.php`, you can have `VaultServiceProvider` pull a KV secret into the environment *and* inject dynamic database credentials automatically, controlled entirely by `.env`:
+
+```env
+VAULT_AUTO_BOOTSTRAP=true
+VAULT_ENV_PATH=oms
+```
+
+```php
+// config/vault.php
+'auto' => [
+    'enabled' => env('VAULT_AUTO_BOOTSTRAP', false),
+    'env_path' => env('VAULT_ENV_PATH', 'env'),
+    'database' => [
+        'pgsql' => 'oms', // Laravel connection 'pgsql' <- Vault database role 'oms'
+    ],
+],
+```
+
+This runs during the provider's `register()` phase — after `config/database.php` has already been parsed, but before Laravel's `DatabaseManager` actually opens any connection (that happens lazily on the first query), so overriding `config('database.connections.pgsql.username'/'password')` here still takes effect. Database credentials go through the same caching described above, so this does **not** mint a new database user on every request.
+
+If a Vault call fails during auto-bootstrap (e.g. Vault is briefly unreachable), the failure is logged (when a PSR-3 logger is bound) and swallowed — your app still boots, falling back to whatever's already in `.env`.
+
+**Laravel Octane caveat:** under Octane (or other persistent-worker runtimes), providers only boot once per worker, not once per request. `VaultServiceProvider` detects Octane automatically and re-applies the auto-bootstrap on every `RequestReceived` event so rotated credentials are picked up live, purging any already-resolved DB connection so it reconnects with the new credentials.
+
+If you only need the env-loading half (no DB credential auto-injection), you can still call this manually and skip the `auto.*` config entirely — see the next section.
 
 ## KV v2 secrets
 
@@ -188,6 +242,13 @@ $creds = $vault->database()->credentials('postgres');
 // $creds = ['username' => '...', 'password' => '...', 'lease_id' => '...', 'lease_duration' => 3600, 'renewable' => true]
 
 $vault->database()->revokeLease($creds['lease_id']);
+```
+
+> ⚠️ `credentials()` is cached by default (TTL'd to the lease's own `lease_duration`) — see [Caching](#caching-dont-skip-this-in-production). Without a cache configured, **every single call mints a brand new database user**, which is slow and will quickly exhaust your database's connection/user limits in production.
+
+```php
+$vault->database()->freshCredentials('postgres'); // bypass cache, force a brand new lease
+$vault->database()->forget('postgres');            // manually invalidate the cached entry
 ```
 
 ## PKI secrets engine
@@ -279,11 +340,39 @@ $shipment->sender_info['name']; // "John"
 $shipment->sender_info['province_code']; // "01" - was never touched
 ```
 
+### Per-cast Transit key
+
+By default every cast uses the single Transit key configured globally via `config('vault.casts.transit_key')` / `VAULT_CAST_TRANSIT_KEY` (default `app`). For data with different sensitivity levels or compliance requirements (e.g. payment data vs. general PII), give different casts their own Transit key with a `key=<transit-key-name>` token — it can appear anywhere in the argument list:
+
+```php
+class Shipment extends Model
+{
+    protected $casts = [
+        'sender_info'  => JsonEncryptedCast::class . ':name,phone,address.street,key=oms-pii',
+        'payment_info' => JsonEncryptedCast::class . ':card_number,cvv,key=oms-payments',
+    ];
+}
+```
+
+Each Transit key must exist in Vault before use:
+
+```php
+Vault::transit()->createKey('oms-pii');
+Vault::transit()->createKey('oms-payments');
+```
+
+```bash
+vault write -f transit/keys/oms-pii
+vault write -f transit/keys/oms-payments
+```
+
+Separate keys let you scope AppRole policies per key (e.g. only the payments service can `encrypt`/`decrypt` with `oms-payments`) and rotate/revoke each one independently of the others.
+
 Notes:
 
 - Dot notation (`address.street`) targets nested keys; everything not listed is left exactly as-is.
 - Values are recognised as already-encrypted by their `vault:v` ciphertext prefix, so re-saving a freshly-loaded model never double-encrypts.
-- The Transit key used is `config('vault.casts.transit_key')` (default `app`) for every field in a given cast. Use separate models/mounts if you need per-field keys.
+- Without a `key=...` token, the cast falls back to `config('vault.casts.transit_key')` (default `app`).
 - This cast requires the Laravel container (it resolves `GtelPhp\Vault\Client` via `app()`); it is not usable outside of Laravel.
 
 ## Multiple connections
@@ -350,8 +439,10 @@ The test suite uses a fake `HttpClientInterface` implementation, so it never tou
 ## Best practices
 
 - **Always use Redis (or another shared) token cache in production web apps.** With `MemoryTokenCache`, every PHP-FPM worker logs in independently, which is wasteful and can exhaust AppRole secret ID usage limits.
+- **Make sure Redis is actually reachable for the database credentials cache.** It's enabled by default, but silently falls back to "no cache" (a fresh lease every call) if Redis isn't bound — verify with `redis-cli KEYS "*gtelphp_vault*"` after a request.
 - **Scope AppRole policies tightly.** Give each application only the KV paths / Transit keys / database roles it actually needs.
-- **Call `Vault::bootstrap()` as early as possible** in your request lifecycle, before any config relying on those env vars is read.
+- **Use separate Transit keys for data with different sensitivity/compliance needs** (see `key=...` in [JsonEncryptedCast](#jsonencryptedcast--selective-jsonb-encryption)), so each can be rotated, revoked, and policy-scoped independently.
+- **Call `Vault::bootstrap()` as early as possible** in your request lifecycle, before any config relying on those env vars is read — or use `auto.enabled` to have `VaultServiceProvider` do it for you.
 - **Rotate Transit keys periodically** with `rotateKey()` and let `rewrap()` upgrade old ciphertexts lazily on read, rather than re-encrypting everything at once.
 - **Prefer short TTLs with auto-renewal** over long-lived tokens — this SDK's `TokenManager` makes that essentially free.
 

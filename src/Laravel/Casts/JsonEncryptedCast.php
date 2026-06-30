@@ -23,6 +23,20 @@ use Illuminate\Database\Eloquent\Model;
  * untouched, and the column keeps being stored/read as a normal JSON
  * object - never as an opaque encrypted blob.
  *
+ * By default every cast uses the Transit key configured in
+ * `config('vault.casts.transit_key')` (env `VAULT_CAST_TRANSIT_KEY`). To
+ * use a different Transit key for sensitive data that needs its own
+ * rotation/revocation lifecycle (e.g. payment info vs. general PII), add a
+ * `key=<transit-key-name>` token anywhere in the argument list:
+ *
+ *     protected $casts = [
+ *         'sender_info' => JsonEncryptedCast::class . ':name,phone,key=oms-pii',
+ *         'payment_info' => JsonEncryptedCast::class . ':card_number,cvv,key=oms-payments',
+ *     ];
+ *
+ * The Transit key itself must already exist in Vault (or be created ahead
+ * of time via `Vault::transit()->createKey('oms-pii')`).
+ *
  * Values already encrypted (i.e. already prefixed with the Vault
  * ciphertext marker "vault:v1:") are left as-is on write, so re-saving a
  * model that was just loaded from the database never double-encrypts.
@@ -30,13 +44,30 @@ use Illuminate\Database\Eloquent\Model;
 final class JsonEncryptedCast implements CastsAttributes
 {
     private const CIPHERTEXT_PREFIX = 'vault:v';
+    private const KEY_TOKEN_PREFIX = 'key=';
 
     /** @var string[] */
     private readonly array $fields;
 
-    public function __construct(string ...$fields)
+    private readonly ?string $explicitKeyName;
+
+    public function __construct(string ...$arguments)
     {
+        $fields = [];
+        $explicitKeyName = null;
+
+        foreach ($arguments as $argument) {
+            if (str_starts_with($argument, self::KEY_TOKEN_PREFIX)) {
+                $explicitKeyName = substr($argument, strlen(self::KEY_TOKEN_PREFIX));
+
+                continue;
+            }
+
+            $fields[] = $argument;
+        }
+
         $this->fields = $fields;
+        $this->explicitKeyName = $explicitKeyName !== '' ? $explicitKeyName : null;
     }
 
     /**
@@ -110,6 +141,10 @@ final class JsonEncryptedCast implements CastsAttributes
 
     private function keyName(): string
     {
+        if ($this->explicitKeyName !== null) {
+            return $this->explicitKeyName;
+        }
+
         return (string) (function_exists('config') ? config('vault.casts.transit_key', 'app') : 'app');
     }
 
