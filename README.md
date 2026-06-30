@@ -83,7 +83,17 @@ Add these to your `.env`:
 VAULT_ADDR=https://vault.internal:8200
 VAULT_ROLE_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 VAULT_SECRET_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+VAULT_DATABASE_ENABLED=true
+VAULT_DATABASE_ROLE=role
+VAULT_ENV_PATH=env
+VAULT_ENV_OVERRIDE=true
 VAULT_TOKEN_CACHE_DRIVER=redis
+VAULT_REDIS_CONNECTION=default
+VAULT_KV_MOUNT=kv-v2
+VAULT_KV_CACHE_ENABLED=true
+VAULT_KV_CACHE_TTL=3600
+VAULT_AUTO_BOOTSTRAP=true
+VAULT_DATABASE_READ_WRITE=true
 ```
 
 Then use the facade anywhere:
